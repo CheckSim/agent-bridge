@@ -21,7 +21,7 @@
 
 Modern AI engineers often rely on multiple AI coding assistants depending on the task:
 - **Google Antigravity CLI (`agy`)**: Incredible for planning mode (`/plan`), DeepMind research agents, background cron tasks, and Gemini 2.5 Pro/Flash models.
-- **Anthropic Claude Code (`claude`)**: Exceptional for fast terminal edits, Sonnet 3.7 reasoning, and direct provider integrations (like OpenRouter).
+- **Anthropic Claude Code (`claude`)**: Exceptional for fast terminal edits, frontier reasoning with flagship models like Claude Opus 5.5 / Sonnet 5.5, and direct provider integrations (like OpenRouter).
 
 However, **these tools live in completely isolated silos**. If you spend 20 minutes designing an architecture with Antigravity and then want Claude Code to implement parts of it, Claude knows **nothing** about your conversation, your decisions, or the files Antigravity touched.
 
