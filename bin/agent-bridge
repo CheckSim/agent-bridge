@@ -1,0 +1,359 @@
+#!/usr/bin/env python3
+"""
+agent-bridge: Seamless Bidirectional Memory & Handoff Bridge for AI Coding Agents
+Author: Simone Cecconi (CheckSim)
+Repository: https://github.com/CheckSim/agent-bridge
+License: MIT
+"""
+
+import os
+import sys
+import json
+import glob
+import sqlite3
+import re
+from datetime import datetime
+
+VERSION = "1.0.0"
+
+GEMINI_DIR = os.path.expanduser("~/.gemini/antigravity-cli")
+CLAUDE_DIR = os.path.expanduser("~/.claude")
+DB_PATH = os.path.join(GEMINI_DIR, "conversation_summaries.db")
+
+# ANSI color formatting
+class Colors:
+    GREEN = "\033[1;32m"
+    BLUE = "\033[1;34m"
+    MAGENTA = "\033[1;35m"
+    CYAN = "\033[1;36m"
+    YELLOW = "\033[1;33m"
+    RED = "\033[1;31m"
+    BOLD = "\033[1m"
+    RESET = "\033[0m"
+
+def clean_antigravity_text(text):
+    """Strip XML wrappers like <USER_REQUEST>, <ADDITIONAL_METADATA>, etc."""
+    if not text:
+        return ""
+    m = re.search(r"<USER_REQUEST>(.*?)</USER_REQUEST>", text, re.DOTALL)
+    if m:
+        text = m.group(1).strip()
+    else:
+        text = re.sub(r"<ADDITIONAL_METADATA>.*?</ADDITIONAL_METADATA>", "", text, flags=re.DOTALL)
+        text = re.sub(r"<USER_SETTINGS_CHANGE>.*?</USER_SETTINGS_CHANGE>", "", text, flags=re.DOTALL)
+        text = re.sub(r"<[^>]+>", "", text)
+    return text.strip()
+
+def get_latest_antigravity_session(cwd):
+    """Query SQLite db for the latest Antigravity conversation matching cwd."""
+    if not os.path.exists(DB_PATH):
+        return None
+    try:
+        con = sqlite3.connect(DB_PATH)
+        cur = con.cursor()
+        cur.execute("""
+            SELECT conversation_id, title, preview, last_modified_time 
+            FROM conversation_summaries 
+            WHERE workspace_uris LIKE ? 
+            ORDER BY last_modified_time DESC LIMIT 1
+        """, (f"%{cwd}%",))
+        row = cur.fetchone()
+        con.close()
+        if not row:
+            return None
+        
+        cid, title, preview, mtime = row
+        t_path = os.path.join(GEMINI_DIR, "brain", cid, ".system_generated", "logs", "transcript.jsonl")
+        if not os.path.exists(t_path):
+            return None
+
+        steps = []
+        with open(t_path, "r", encoding="utf-8", errors="ignore") as f:
+            for line in f:
+                line = line.strip()
+                if line:
+                    try:
+                        steps.append(json.loads(line))
+                    except:
+                        pass
+
+        user_requests = []
+        tools_called = []
+        last_model_response = ""
+
+        for s in steps:
+            stype = s.get("type")
+            if stype == "USER_INPUT":
+                raw_c = s.get("content", "")
+                cleaned = clean_antigravity_text(raw_c)
+                if cleaned:
+                    user_requests.append(cleaned)
+            elif stype == "PLANNER_RESPONSE":
+                content = s.get("content", "")
+                if content:
+                    last_model_response = content
+                calls = s.get("tool_calls", [])
+                for c in calls:
+                    tname = c.get("name", "")
+                    args = c.get("args", {})
+                    if tname in ["write_file", "edit_file"]:
+                        path = args.get("Path") or args.get("filePath") or ""
+                        tools_called.append(f"{tname}: {os.path.basename(path)}")
+                    elif tname == "run_command":
+                        cmd = args.get("CommandLine") or args.get("command") or ""
+                        if len(cmd) > 50:
+                            cmd = cmd[:47] + "..."
+                        tools_called.append(f"run_command: {cmd}")
+
+        recent_reqs = user_requests[-3:] if user_requests else ["Nessuna richiesta esplicita"]
+        unique_tools = list(dict.fromkeys(tools_called))[-5:]
+
+        if len(last_model_response) > 500:
+            last_model_response = last_model_response[:497] + "..."
+
+        return {
+            "conversation_id": cid,
+            "title": title or "Senza titolo",
+            "mtime": mtime,
+            "recent_requests": recent_reqs,
+            "recent_tools": unique_tools,
+            "last_response": last_model_response
+        }
+    except Exception:
+        return None
+
+def get_latest_claude_session(cwd):
+    """Find and parse the latest Claude Code session for cwd."""
+    sanitized = cwd.replace("/", "-")
+    proj_dir = os.path.join(CLAUDE_DIR, "projects", sanitized)
+    if not os.path.exists(proj_dir):
+        return None
+
+    files = glob.glob(os.path.join(proj_dir, "*.jsonl"))
+    if not files:
+        return None
+
+    files.sort(key=os.path.getmtime, reverse=True)
+    latest_file = files[0]
+    mtime = datetime.fromtimestamp(os.path.getmtime(latest_file)).isoformat()
+
+    try:
+        records = []
+        with open(latest_file, "r", encoding="utf-8", errors="ignore") as f:
+            for line in f:
+                line = line.strip()
+                if line:
+                    try:
+                        records.append(json.loads(line))
+                    except:
+                        pass
+
+        user_prompts = []
+        tool_actions = []
+        last_assistant_text = ""
+
+        for r in records:
+            rtype = r.get("type")
+            if rtype == "user" and not r.get("isMeta"):
+                msg = r.get("message", {})
+                content = msg.get("content", "")
+                if isinstance(content, str):
+                    if not content.startswith("<command-name>") and not content.startswith("<local-command"):
+                        user_prompts.append(content.strip())
+            tur = r.get("toolUseResult")
+            if tur:
+                action_type = tur.get("type", "")
+                fpath = tur.get("filePath", "")
+                if fpath:
+                    tool_actions.append(f"{action_type}: {os.path.basename(fpath)}")
+            if r.get("message") and r.get("message").get("role") == "assistant":
+                c_list = r.get("message", {}).get("content", [])
+                if isinstance(c_list, list):
+                    for item in c_list:
+                        if isinstance(item, dict) and item.get("type") == "text":
+                            txt = item.get("text", "").strip()
+                            if txt:
+                                last_assistant_text = txt
+            elif rtype == "system" and r.get("subtype") == "away_summary":
+                last_assistant_text = r.get("content", "").strip()
+
+        recent_prompts = user_prompts[-3:] if user_prompts else ["Nessuna richiesta"]
+        unique_tools = list(dict.fromkeys(tool_actions))[-5:]
+
+        if len(last_assistant_text) > 500:
+            last_assistant_text = last_assistant_text[:497] + "..."
+
+        session_id = os.path.basename(latest_file).replace(".jsonl", "")
+        return {
+            "session_id": session_id,
+            "mtime": mtime,
+            "recent_prompts": recent_prompts,
+            "recent_tools": unique_tools,
+            "last_response": last_assistant_text
+        }
+    except Exception:
+        return None
+
+def handoff_to_claude(cwd, extra_args):
+    """Extract Antigravity state and launch Claude Code."""
+    dry_run = "--dry-run" in extra_args
+    clean_args = [a for a in extra_args if a != "--dry-run"]
+
+    session = get_latest_antigravity_session(cwd)
+    if not session:
+        print(f"{Colors.YELLOW}[Agent Bridge]{Colors.RESET} Nessuna sessione Antigravity trovata per questo workspace.")
+        if dry_run:
+            print("[DRY-RUN] Avvierebbe claude normalmente senza briefing.")
+            return
+        cmd = ["claude"] + clean_args
+        os.execvp("claude", cmd)
+        return
+
+    reqs_str = "\n".join([f"  * {r}" for r in session['recent_requests']])
+    tools_str = "\n".join([f"  * {t}" for t in session['recent_tools']]) if session['recent_tools'] else "  * Nessuna modifica file diretta"
+
+    briefing = (
+        f"[CROSS-AGENT HANDOFF FROM ANTIGRAVITY CLI]\n"
+        f"Workspace: {cwd}\n"
+        f"Sessione Antigravity precedente: {session['title']} (ID: {session['conversation_id']})\n"
+        f"Ultima modifica: {session['mtime']}\n\n"
+        f"Ultime richieste dell'utente in Antigravity:\n{reqs_str}\n\n"
+        f"Azioni e file toccati da Antigravity:\n{tools_str}\n\n"
+        f"Ultimo stato/risposta di Antigravity:\n{session['last_response']}\n"
+        f"--------------------------------------------------\n"
+        f"Istruzione per Claude: Continua il lavoro partendo esattamente da questo stato senza richiedere spiegazioni già fornite."
+    )
+
+    print(f"{Colors.GREEN}[Agent Bridge]{Colors.RESET} Sincronizzazione da Antigravity CLI -> Claude Code...")
+    print(f"  * Sessione Antigravity: {Colors.BOLD}{session['title']}{Colors.RESET} ({session['conversation_id'][:8]}...)")
+    print(f"  * Ultima richiesta: {session['recent_requests'][-1][:60]}...")
+
+    if dry_run:
+        print("\n[DRY-RUN] Briefing generato per Claude Code:")
+        print("--------------------------------------------------")
+        print(briefing)
+        print("--------------------------------------------------")
+        return
+
+    print("Avvio Claude Code con il contesto iniettato...\n")
+    cmd = ["claude", "--append-system-prompt", briefing] + clean_args
+    os.execvp("claude", cmd)
+
+def handoff_to_agy(cwd, extra_args):
+    """Extract Claude Code state and launch Antigravity CLI."""
+    dry_run = "--dry-run" in extra_args
+    clean_args = [a for a in extra_args if a != "--dry-run"]
+
+    session = get_latest_claude_session(cwd)
+    if not session:
+        print(f"{Colors.YELLOW}[Agent Bridge]{Colors.RESET} Nessuna sessione Claude Code trovata per questo workspace.")
+        if dry_run:
+            print("[DRY-RUN] Avvierebbe agy normalmente senza briefing.")
+            return
+        cmd = ["agy"] + clean_args
+        os.execvp("agy", cmd)
+        return
+
+    prompts_str = "\n".join([f"  * {p}" for p in session['recent_prompts']])
+    tools_str = "\n".join([f"  * {t}" for t in session['recent_tools']]) if session['recent_tools'] else "  * Nessuna modifica file diretta"
+
+    user_extra = " ".join(clean_args) if clean_args else "Riprendi il lavoro iniziato su Claude Code, fai un brevissimo riepilogo dello stato e chiedimi come procedere."
+
+    handoff_prompt = (
+        f"Continua il lavoro iniziato in Claude Code.\n\n"
+        f"[BRIEFING HANDOFF DA CLAUDE CODE]\n"
+        f"Workspace: {cwd}\n"
+        f"Sessione Claude: {session['session_id'][:8]}... (Modificata: {session['mtime']})\n"
+        f"Ultime richieste affrontate su Claude:\n{prompts_str}\n\n"
+        f"Azioni e file toccati da Claude:\n{tools_str}\n\n"
+        f"Ultimo stato/risposta di Claude:\n{session['last_response']}\n\n"
+        f"Istruzione attuale: {user_extra}"
+    )
+
+    print(f"{Colors.GREEN}[Agent Bridge]{Colors.RESET} Sincronizzazione da Claude Code -> Antigravity CLI...")
+    print(f"  * Sessione Claude: {Colors.BOLD}{session['session_id'][:8]}...{Colors.RESET}")
+    print(f"  * Ultima richiesta: {session['recent_prompts'][-1][:60]}...")
+
+    if dry_run:
+        print("\n[DRY-RUN] Briefing generato per Antigravity CLI:")
+        print("--------------------------------------------------")
+        print(handoff_prompt)
+        print("--------------------------------------------------")
+        return
+
+    print("Avvio Antigravity CLI in modalità interattiva con contesto...\n")
+    cmd = ["agy", "--prompt-interactive", handoff_prompt]
+    os.execvp("agy", cmd)
+
+def show_status(cwd):
+    """Display status of all agents in the current workspace."""
+    print(f"\n{Colors.CYAN}=== AGENT BRIDGE STATUS ==={Colors.RESET}")
+    print(f"Workspace: {Colors.BOLD}{cwd}{Colors.RESET}\n")
+
+    # Antigravity status
+    agy_s = get_latest_antigravity_session(cwd)
+    if agy_s:
+        print(f"{Colors.BLUE}[Antigravity CLI (agy)]{Colors.RESET}")
+        print(f"  * ID: {agy_s['conversation_id']}")
+        print(f"  * Titolo: {agy_s['title']}")
+        print(f"  * Ultima modifica: {agy_s['mtime']}")
+        print(f"  * Ultima richiesta: {agy_s['recent_requests'][-1]}")
+        print(f"  * File/Tool recenti: {', '.join(agy_s['recent_tools']) if agy_s['recent_tools'] else 'Nessuno'}")
+    else:
+        print(f"{Colors.BLUE}[Antigravity CLI (agy)]{Colors.RESET} Nessuna sessione registrata in questo workspace.")
+
+    print()
+
+    # Claude Code status
+    claude_s = get_latest_claude_session(cwd)
+    if claude_s:
+        print(f"{Colors.MAGENTA}[Claude Code (claude)]{Colors.RESET}")
+        print(f"  * Session ID: {claude_s['session_id']}")
+        print(f"  * Ultima modifica: {claude_s['mtime']}")
+        print(f"  * Ultima richiesta: {claude_s['recent_prompts'][-1]}")
+        print(f"  * File/Tool recenti: {', '.join(claude_s['recent_tools']) if claude_s['recent_tools'] else 'Nessuno'}")
+    else:
+        print(f"{Colors.MAGENTA}[Claude Code (claude)]{Colors.RESET} Nessuna sessione registrata in questo workspace.")
+    print()
+
+def print_help():
+    help_text = f"""
+{Colors.BOLD}agent-bridge v{VERSION}{Colors.RESET} - Seamless Bidirectional Handoff Bridge for AI Coding Agents
+Author: Simone Cecconi (CheckSim)
+
+{Colors.BOLD}USAGE:{Colors.RESET}
+  agent-bridge --to-claude [prompt / args...]   Handoff from Antigravity to Claude Code (alias: agy2claude)
+  agent-bridge --to-agy [prompt / args...]      Handoff from Claude Code to Antigravity CLI (alias: claude2agy)
+  agent-bridge --status                         Display memory status for current workspace (alias: agent-status)
+  agent-bridge --version                        Show version
+  agent-bridge --help                           Show this help message
+
+{Colors.BOLD}OPTIONS:{Colors.RESET}
+  --dry-run                                     Preview handoff briefing without launching target agent
+"""
+    print(help_text)
+
+def main():
+    cwd = os.getcwd()
+    if len(sys.argv) < 2 or sys.argv[1] in ["--help", "-h"]:
+        print_help()
+        sys.exit(0)
+
+    action = sys.argv[1]
+    extra = sys.argv[2:]
+
+    if action in ["--version", "-v"]:
+        print(f"agent-bridge v{VERSION}")
+        sys.exit(0)
+    elif action in ["--to-claude", "-c", "agy2claude"]:
+        handoff_to_claude(cwd, extra)
+    elif action in ["--to-agy", "-a", "claude2agy"]:
+        handoff_to_agy(cwd, extra)
+    elif action in ["--status", "-s", "status"]:
+        show_status(cwd)
+    else:
+        print(f"{Colors.RED}Errore:{Colors.RESET} Azione non riconosciuta '{action}'. Esegui 'agent-bridge --help'.")
+        sys.exit(1)
+
+if __name__ == "__main__":
+    main()
